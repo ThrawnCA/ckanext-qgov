@@ -7,9 +7,8 @@ The filter can be enabled simply by invoking 'intercept_csrf()'.
 import ckan.lib.base as base
 import re
 from re import DOTALL, IGNORECASE, MULTILINE
-from genshi.template import MarkupTemplate
 from logging import getLogger
-from pylons import request, response
+from ckan.common import request, response, g
 
 LOG = getLogger(__name__)
 
@@ -21,11 +20,6 @@ RAW_BEFORE = base.BaseController.__before__
 """
 TOKEN_FIELD_NAME = 'token'
 
-# We need to edit confirm-action links, which get intercepted by JavaScript,
-#regardless of which order their 'data-module' and 'href' attributes appear.
-CONFIRM_LINK = re.compile(r'(<a [^>]*data-module=["\']confirm-action["\'][^>]*href=["\'][^"\'?]+)(["\'])', IGNORECASE | MULTILINE)
-CONFIRM_LINK_REVERSED = re.compile(r'(<a [^>]*href=["\'][^"\'?]+)(["\'][^>]*data-module=["\']confirm-action["\'])', IGNORECASE | MULTILINE)
-
 """
 This will match a POST form that has whitespace after the opening tag (which all existing forms do).
 Once we have injected a token immediately after the opening tag,
@@ -35,64 +29,143 @@ POST_FORM = re.compile(r'(<form [^>]*method=["\']post["\'][^>]*>)([^<]*\s<)', IG
 
 """The format of the token HTML field.
 """
-TOKEN_PATTERN = r'<input type="hidden" name="' + TOKEN_FIELD_NAME + '" value="{token}"/>'
-TOKEN_SEARCH_PATTERN = re.compile(TOKEN_PATTERN.format(token=r'([0-9a-f]+)'))
+HMAC_PATTERN=re.compile(r'^[0-9a-z]+![0-9]+/[0-9]+/[-_a-z0-9%]+$', IGNORECASE)
 API_URL = re.compile(r'^/api\b.*')
+CONFIRM_MODULE_PATTERN = r'data-module=["\']confirm-action["\']'
+HREF_URL_PATTERN = r'href=["\']([^"\']+)'
+
+# We need to edit confirm-action links, which get intercepted by JavaScript,
+#regardless of which order their 'data-module' and 'href' attributes appear.
+CONFIRM_LINK = re.compile(r'(<a [^>]*' + CONFIRM_MODULE_PATTERN + '[^>]*' + HREF_URL_PATTERN + ')(["\'])', IGNORECASE | MULTILINE)
+CONFIRM_LINK_REVERSED = re.compile(r'(<a [^>]*' + HREF_URL_PATTERN + ')(["\'][^>]*' + CONFIRM_MODULE_PATTERN + ')', IGNORECASE | MULTILINE)
 
 def is_logged_in():
     return request.cookies.get("auth_tkt")
 
 """ Rewrite HTML to insert tokens if applicable.
 """
-def anti_csrf_render(template_name, extra_vars=None, cache_key=None, cache_type=None, cache_expire=None, method='xhtml', loader_class=MarkupTemplate, cache_force=None, renderer=None):
-    html = apply_token(RAW_RENDER(template_name, extra_vars, cache_key, cache_type, cache_expire, method, loader_class, cache_force, renderer))
-    return html
 
 def anti_csrf_render_jinja2(template_name, extra_vars=None):
     html = apply_token(RAW_RENDER_JINJA(template_name, extra_vars))
     return html
 
 def apply_token(html):
-    if not is_logged_in() or not POST_FORM.search(html):
+    if not is_logged_in() or (not POST_FORM.search(html) and not re.search(CONFIRM_MODULE_PATTERN, html)):
         return html
 
-    token_match = TOKEN_SEARCH_PATTERN.search(html)
-    if token_match:
-        token = token_match.group(1)
-    else:
-        token = get_server_token()
+    token = get_response_token()
 
     def insert_form_token(form_match):
-        return form_match.group(1) + TOKEN_PATTERN.format(token=token) + form_match.group(2)
+        return form_match.group(1) + '<input type="hidden" name="{}" value="{}"/>'.format(TOKEN_FIELD_NAME, token) + form_match.group(2)
 
     def insert_link_token(link_match):
-        return link_match.group(1) + '?' + TOKEN_FIELD_NAME + '=' + token + link_match.group(2)
+        if '?' in link_match.group(2):
+            separator = '&'
+        else:
+            separator = '?'
+        return link_match.group(1) + separator + TOKEN_FIELD_NAME + '=' + token + link_match.group(3)
 
     return CONFIRM_LINK_REVERSED.sub(insert_link_token, CONFIRM_LINK.sub(insert_link_token, POST_FORM.sub(insert_form_token, html)))
 
-def get_server_token():
+def get_cookie_token():
     """Retrieve the token expected by the server.
 
     This will be retrieved from the 'token' cookie, if it exists.
-    If not, a new token will be generated and a new cookie set.
+    If not, an error will occur.
+    """
+    if request.cookies.has_key(TOKEN_FIELD_NAME):
+        LOG.debug("Obtaining token from cookie")
+        token = request.cookies.get(TOKEN_FIELD_NAME)
+    if token is None or token.strip() == "":
+        csrf_fail("CSRF token is blank")
 
-    This can be used either to populate a new form on a GET request, or to validate a POST request
-    (since a missing cookie would result in a new token, which would certainly not match the submitted form).
+    return token
+
+def validate_token(token):
+    if not HMAC_PATTERN.match(token):
+        return false
+
+    import time, hmac, hashlib, urllib
+
+    now = int(time.time())
+
+    parts = token.split('!', 1)
+    provided_hmac = unicode(parts[0])
+    message = parts[1]
+
+    secret_key = _get_secret_key()
+    expected_hmac = unicode(hmac.HMAC(secret_key, message, hashlib.sha512).hexdigest())
+    if not hmac.compare_digest(expected_hmac, provided_hmac):
+        return False
+
+    message_parts = message.split('/', 2)
+    timestamp = int(message_parts[0])
+    username = message_parts[2]
+
+    # allow tokens up to 30 minutes old
+    if now < timestamp or now - timestamp > 60 * 30:
+        return False
+    if username != urllib.quote(g.userobj.name):
+        return False
+
+    return True
+
+def get_response_token():
+    """Retrieve the token to be injected into pages.
+
+    This will be retrieved from the 'token' cookie, if it exists and is fresh.
+    If not, a new token will be generated and a new cookie set.
     """
     # ensure that the same token is used when a page is assembled from pieces
-    if request.environ['webob.adhoc_attrs'].has_key('server_token'):
-        token = request.server_token
+    if request.environ['webob.adhoc_attrs'].has_key('response_token'):
+        LOG.debug("Reusing response token from request attributes")
+        token = request.response_token
     elif request.cookies.has_key(TOKEN_FIELD_NAME):
-        token = request.cookies.pop(TOKEN_FIELD_NAME)
+        LOG.debug("Obtaining token from cookie")
+        token = request.cookies.get(TOKEN_FIELD_NAME)
+        if not validate_token(token) or is_soft_expired(token):
+            LOG.debug("Invalid or expired cookie token; making new token cookie")
+            token = create_response_token()
+        request.response_token = token
     else:
-        import binascii, os
-        token = binascii.hexlify(os.urandom(32))
-        response.set_cookie(TOKEN_FIELD_NAME, token, max_age=600, httponly=True)
+        LOG.debug("No valid token found; making new token cookie")
+        token = create_response_token()
+        request.response_token = token
 
-    if token is None or token.strip() == "":
-        csrf_fail("Server token is blank")
+    return token
 
-    request.server_token = token
+def is_soft_expired(token):
+    """Check whether the token is old enough to need rotation.
+    It may still be valid, but it's time to generate a new one.
+
+    The current rotation age is 10 minutes.
+    """
+    import time
+
+    now = int(time.time())
+    parts = token.split('!', 1)
+    message = parts[1]
+    message_parts = message.split('/', 2)
+    timestamp = int(message_parts[0])
+
+    return now - timestamp > 60 * 10
+
+def _get_secret_key():
+    from ckan.common import config
+
+    return config.get('beaker.session.secret')
+
+def create_response_token():
+    import time, random, hmac, hashlib, urllib
+
+    secret_key = _get_secret_key()
+    username = urllib.quote(g.userobj.name)
+    timestamp = int(time.time())
+    nonce = random.randint(1, 999999)
+    message = "{}/{}/{}".format(timestamp, nonce, username)
+    token = "{}!{}".format(hmac.HMAC(secret_key, message, hashlib.sha512).hexdigest(), message)
+
+    response.set_cookie(TOKEN_FIELD_NAME, token, secure=True, httponly=True)
     return token
 
 # Check token on applicable requests
@@ -101,13 +174,13 @@ def is_request_exempt():
     return not is_logged_in() or API_URL.match(request.path) or request.method in {'GET', 'HEAD', 'OPTIONS'}
 
 def anti_csrf_before(obj, action, **params):
-    if not is_request_exempt() and get_server_token() != get_post_token():
-        csrf_fail("Could not match session token with form token")
-
     RAW_BEFORE(obj, action)
 
+    if not is_request_exempt() and get_cookie_token() != get_post_token():
+        csrf_fail("Could not match session token with form token")
+
 def csrf_fail(message):
-    from pylons.controllers.util import abort
+    from flask import abort
     LOG.error(message)
     abort(403, "Your form submission could not be validated")
 
@@ -117,14 +190,14 @@ def get_post_token():
     This is normally a single 'token' parameter in the POST body.
     However, for compatibility with 'confirm-action' links,
     it is also acceptable to provide the token as a query string parameter,
-    if it is the *only* parameter of either kind.
+    if there is no POST body.
     """
     if request.environ['webob.adhoc_attrs'].has_key(TOKEN_FIELD_NAME):
         return request.token
 
-    # handle query string token if there are no other parameters
+    # handle query string token if there are no POST parameters
     # this is needed for the 'confirm-action' JavaScript module
-    if not request.POST and len(request.GET) == 1 and len(request.GET.getall(TOKEN_FIELD_NAME)) == 1:
+    if not request.POST and len(request.GET.getall(TOKEN_FIELD_NAME)) == 1:
         request.token = request.GET.getone(TOKEN_FIELD_NAME)
         del request.GET[TOKEN_FIELD_NAME]
         return request.token
@@ -140,9 +213,11 @@ def get_post_token():
     # drop token from request so it doesn't populate resource extras
     del request.POST[TOKEN_FIELD_NAME]
 
+    if not validate_token(request.token):
+        csrf_fail("Invalid token format")
+
     return request.token
 
 def intercept_csrf():
-    base.render = anti_csrf_render
     base.render_jinja2 = anti_csrf_render_jinja2
     base.BaseController.__before__ = anti_csrf_before

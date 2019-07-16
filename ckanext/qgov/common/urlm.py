@@ -1,41 +1,32 @@
 import ckan.lib.base as base
+import ckan.controllers.group as group
+import ckan.controllers.package as package
+import ckan.controllers.user as user
 
-from pylons.controllers.util import redirect
+import ckan.lib.helpers as helpers
 
 from logging import getLogger
 LOG = getLogger(__name__)
 
 RAW_ABORT = base.abort
 
-def configure_for_environment(site_url):
-    if 'staging' in site_url:
-        endpoint = 'https://test.smartservice.qld.gov.au/services/url'
-    elif site_url.endswith('-tst'):
-        endpoint = 'https://test.smartservice.qld.gov.au/services/url'
-        proxy = 'proxy:3128'
-    elif site_url.endswith('-local'):
-        endpoint = 'http://localhost:8091/url'
-        proxy = 'proxy:3128'
-    else:
-        endpoint = 'https://www.smartservice.qld.gov.au/services/url'
-
-    configure_urlm(endpoint, proxy)
-
 def configure_urlm(app_path, proxy):
     """
-    app_path: The path to the URL Management system, eg
-    https://www.smartservice.qld.gov.au/services/url
-
+    app_path: The path to the URL Management system
     proxy: The proxy, if any, to be used in contacting the URL Management system.
     """
     global URLM_ENDPOINT, URLM_PROXY
-    URLM_ENDPOINT = app_path + '/translate/v3.json?sourceurl={source}'
+    URLM_ENDPOINT = app_path
     URLM_PROXY = proxy
 
     LOG.info("Using URL Management system at {endpoint} via proxy {proxy}".format(endpoint=URLM_ENDPOINT, proxy=URLM_PROXY))
 
 def intercept_404():
     base.abort = abort_with_purl
+    group.abort = base.abort
+    package.abort = base.abort
+    # related.abort = base.abort
+    user.abort = base.abort
 
 def abort_with_purl(status_code=None, detail='', headers=None, comment=None):
     if status_code == 404:
@@ -52,11 +43,11 @@ def abort_with_purl(status_code=None, detail='', headers=None, comment=None):
             if response['Status'] == 301:
                 location = response['Headers']['location']
                 LOG.info("Found; redirecting to {location}".format(location=location))
-                redirect(location, 301)
+                helpers.redirect_to(location, 301)
                 return
             else:
                 LOG.warn("No match in URL Management system")
-        except urllib2.URLError, e:
+        except urllib2.URLError as e:
             LOG.error("Failed to contact URL Management system: {error}".format(error=e))
             pass
     return RAW_ABORT(status_code, detail, headers, comment)
